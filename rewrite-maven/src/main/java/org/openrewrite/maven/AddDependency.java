@@ -229,9 +229,17 @@ public class AddDependency extends ScanningRecipe<AddDependency.Scanned> {
                     return maven;
                 }
 
+                MavenResolutionResult resolutionResult = getResolutionResult();
+                if (Boolean.TRUE.equals(acceptTransitive) && !resolutionResult.findDependencies(d -> d.isTransitive() &&
+                        groupId.equals(d.getGroupId()) && artifactId.equals(d.getArtifactId()), null).isEmpty()) {
+                    // A parent pom updated earlier in this run, e.g. by a version bump, is not yet reflected in this
+                    // pom's resolution result, and may no longer bring in the dependency
+                    resolutionResult = UpdateMavenModel.resolveAgainstUpdatedParents(resolutionResult, ctx);
+                }
+
                 // If the dependency is already on the classpath as a transitive dependency (and the recipe accepts that),
                 // no direct declaration is needed. Direct duplicates are handled by AddDependencyVisitor below.
-                Map<Scope, List<ResolvedDependency>> dependencies = getResolutionResult().getDependencies();
+                Map<Scope, List<ResolvedDependency>> dependencies = resolutionResult.getDependencies();
                 if (dependencies.get(Scope.Compile) != null) {
                     for (ResolvedDependency d : dependencies.get(Scope.Compile)) {
                         if (d.isTransitive() &&

@@ -28,11 +28,19 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 import static java.util.Collections.emptyList;
 import static java.util.stream.Collectors.toList;
 
 public class UpdateMavenModel<P> extends MavenVisitor<P> {
+
+    /**
+     * The requested pom of each parent pom updated in this run, by the id of its resolution result.
+     * The resolution results of its modules still hold it as it was parsed.
+     */
+    private static final String UPDATED_PARENTS = "org.openrewrite.maven.UpdateMavenModel.updatedParents";
 
     @Override
     public Xml visitDocument(Xml.Document document, P p) {
@@ -146,6 +154,10 @@ public class UpdateMavenModel<P> extends MavenVisitor<P> {
             }
             MavenResolutionResult updated = updateResult(ctx, resolutionResult.withPom(resolutionResult.getPom().withRequested(requested)),
                     projectPoms);
+            if (!updated.getModules().isEmpty()) {
+                Map<UUID, Pom> updatedParents = ctx.computeMessageIfAbsent(UPDATED_PARENTS, k -> new ConcurrentHashMap<>());
+                updatedParents.put(updated.getId(), requested);
+            }
             markDirtyForAmbiguityRecipes(ctx, document, updated);
             return document.withMarkers(document.getMarkers().computeByType(getResolutionResult(),
                     (original, ignored) -> updated));
@@ -175,6 +187,43 @@ public class UpdateMavenModel<P> extends MavenVisitor<P> {
                 JavaSourceSet.markDirty(ctx, moduleName);
             }
             markModulesRecursive(ctx, module);
+        }
+    }
+
+    /**
+     * A pom's resolution result is not updated when one of its parents is updated earlier in the run, e.g. by a
+     * version property bump. Resolve the pom against its updated parents, leaving its marker as it is.
+     *
+     * @return the pom resolved against its updated parents, or {@code resolutionResult} when no parent was updated,
+     * the update makes no difference to this pom, or it fails to resolve.
+     */
+    static MavenResolutionResult resolveAgainstUpdatedParents(MavenResolutionResult resolutionResult, ExecutionContext ctx) {
+        Map<UUID, Pom> updatedParents = ctx.getMessage(UPDATED_PARENTS);
+        if (updatedParents == null) {
+            return resolutionResult;
+        }
+        Map<Path, Pom> projectPoms = resolutionResult.getProjectPoms();
+        boolean parentUpdated = false;
+        for (MavenResolutionResult parent = resolutionResult.getParent(); parent != null; parent = parent.getParent()) {
+            Pom updatedParent = updatedParents.get(parent.getId());
+            Path parentPath = parent.getPom().getRequested().getSourcePath();
+            if (updatedParent != null && parentPath != null) {
+                projectPoms.put(parentPath, updatedParent);
+                parentUpdated = true;
+            }
+        }
+        if (!parentUpdated) {
+            return resolutionResult;
+        }
+        MavenPomDownloader downloader = new MavenPomDownloader(projectPoms, ctx,
+                MavenExecutionContextView.view(ctx).effectiveSettings(resolutionResult),
+                resolutionResult.getActiveProfiles());
+        try {
+            ResolvedPom resolved = resolutionResult.getPom().resolve(ctx, downloader);
+            return resolved == resolutionResult.getPom() ? resolutionResult :
+                    resolutionResult.withPom(resolved).resolveDependencies(downloader, ctx);
+        } catch (MavenDownloadingException | MavenDownloadingExceptions e) {
+            return resolutionResult;
         }
     }
 
